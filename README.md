@@ -73,7 +73,7 @@ D:\Tools\GitAutoCommitTool\
 7. 填写 Git 用户名和邮箱，然后点击“保存身份”。
 8. 需要立即生成一次提交时，点击 `Commit`。
 9. 需要把本地提交同步到远程时，点击 `Push`。
-10. 需要定时自动提交时，打开 `Auto Commit` 开关，并设置提交间隔与提交前缀。
+10. 需要定时自动提交时，打开 `Auto Commit` 开关，并设置提交间隔。
 
 ## `git init` 做了什么
 
@@ -102,7 +102,7 @@ D:\Tools\GitAutoCommitTool\
 - GitHub 链接：用于设置或更新 `origin`
 - Git 用户名 / Git 邮箱：写入当前仓库的 Git 身份
 - 间隔：自动提交的执行周期，单位为秒
-- Commit 前缀：自动提交时写入提交信息前半部分，默认是 `auto`
+- 自动提交格式：固定为 `auto snapshot 编号 提交时间`
 - Commit：立即执行一次本地提交
 - Push：把本地提交推送到远程仓库
 - 刷新：重新读取仓库状态
@@ -120,7 +120,7 @@ D:\Tools\GitAutoCommitTool\
 自动生成的提交信息格式类似：
 
 ```text
-auto: 2026-06-28 16:30:00
+auto snapshot 12 2026-06-28 16:30:00
 ```
 
 说明：

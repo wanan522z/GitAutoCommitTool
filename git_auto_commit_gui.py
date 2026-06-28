@@ -1,5 +1,6 @@
 ﻿import ctypes
 import ctypes.wintypes
+import hashlib
 import json
 import os
 import shutil
@@ -9,16 +10,23 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 
 
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 CONFIG_FILENAME = "git_auto_commit_gui_config.json"
 LOG_FILENAME = "git_auto_commit_gui.log"
 APP_STORAGE_DIRNAME = "GitAutoCommitTool"
+AUTO_COMMIT_PREFIX = "auto snapshot"
 
 # --- 鐧借壊鐜颁唬涓婚閰嶈壊 ---
 WINDOW = "#E9EEF6"        # 绐楀彛搴曡壊锛堜細琚涓洪€忔槑鑹诧紝闇插嚭浜氬厠鍔涙ā绯婏級
@@ -508,7 +516,7 @@ class AutoCommitWorker(threading.Thread):
         self.app = app
         self.repo_path = repo_path
         self.interval_seconds = max(2, int(interval_seconds))
-        self.prefix = prefix.strip() or "auto"
+        self.prefix = prefix.strip() or AUTO_COMMIT_PREFIX
         self.stop_event = threading.Event()
 
     def stop(self):
@@ -540,8 +548,9 @@ class AutoCommitApp:
         self._size_window(1700, 1200)
         self.root.minsize(1400, 860)
 
-        self.git_lock = threading.Lock()
         self.log_lock = threading.Lock()
+        self.repo_locks: dict[str, threading.Lock] = {}
+        self.repo_locks_guard = threading.Lock()
         self.auto_worker: AutoCommitWorker | None = None
         self.refresh_running = False
         self.refresh_pending = False
@@ -582,7 +591,7 @@ class AutoCommitApp:
         self.username_var = tk.StringVar()
         self.email_var = tk.StringVar()
         self.interval_var = tk.IntVar(value=5)
-        self.prefix_var = tk.StringVar(value="auto")
+        self.prefix_var = tk.StringVar(value=AUTO_COMMIT_PREFIX)
         self.push_history: list[str] = []
 
         self.mode_var = tk.StringVar(value="空闲")
@@ -827,7 +836,7 @@ class AutoCommitApp:
         field_row.columnconfigure(1, weight=1)
         tk.Label(field_row, text="\u95f4\u9694", bg=CARD_BG, fg=TEXT_MUTED,
                  font=F_MUTED).grid(row=0, column=0, sticky="w")
-        tk.Label(field_row, text="Commit \u524d\u7f00", bg=CARD_BG, fg=TEXT_MUTED,
+        tk.Label(field_row, text="\u81ea\u52a8\u63d0\u4ea4\u683c\u5f0f", bg=CARD_BG, fg=TEXT_MUTED,
                  font=F_MUTED).grid(row=0, column=1, sticky="w", padx=(14, 0))
         interval_row = tk.Frame(field_row, bg=CARD_BG)
         interval_row.grid(row=1, column=0, sticky="w")
@@ -837,6 +846,7 @@ class AutoCommitApp:
                  font=F_MUTED).grid(row=0, column=1, padx=(6, 0))
         self.prefix_entry = ttk.Entry(field_row, textvariable=self.prefix_var)
         self.prefix_entry.grid(row=1, column=1, sticky="ew", padx=(14, 0))
+        self.prefix_entry.configure(state="readonly")
 
         primary_row = tk.Frame(inner, bg=CARD_BG)
         primary_row.grid(row=4, column=0, sticky="ew", pady=(14, 0))
@@ -1162,6 +1172,52 @@ class AutoCommitApp:
     def get_log_path(self) -> Path:
         return self.get_storage_dir() / LOG_FILENAME
 
+    def get_repo_lock_dir(self) -> Path:
+        return self.get_storage_dir() / "repo_locks"
+
+    def get_repo_lock_key(self, repo_path: Path) -> str:
+        try:
+            normalized = str(repo_path.resolve()).lower()
+        except Exception:
+            normalized = str(repo_path).lower()
+        return hashlib.sha1(normalized.encode("utf-8", errors="replace")).hexdigest()
+
+    def get_repo_mutex(self, repo_path: Path) -> threading.Lock:
+        key = self.get_repo_lock_key(repo_path)
+        with self.repo_locks_guard:
+            lock = self.repo_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self.repo_locks[key] = lock
+            return lock
+
+    @contextmanager
+    def repo_operation_lock(self, repo_path: Path):
+        repo_mutex = self.get_repo_mutex(repo_path)
+        with repo_mutex:
+            lock_file = None
+            try:
+                if msvcrt is not None:
+                    lock_dir = self.get_repo_lock_dir()
+                    lock_dir.mkdir(parents=True, exist_ok=True)
+                    lock_path = lock_dir / f"{self.get_repo_lock_key(repo_path)}.lock"
+                    lock_file = lock_path.open("a+b")
+                    lock_file.seek(0, os.SEEK_END)
+                    if lock_file.tell() == 0:
+                        lock_file.write(b"0")
+                        lock_file.flush()
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+                yield
+            finally:
+                if lock_file is not None:
+                    try:
+                        lock_file.seek(0)
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                    except Exception:
+                        pass
+                    lock_file.close()
+
     def normalize_github_url(self, raw: str) -> str:
         value = (raw or "").strip()
         if not value:
@@ -1200,7 +1256,7 @@ class AutoCommitApp:
         self.username_var.set(data.get("username", ""))
         self.email_var.set(data.get("email", ""))
         self.interval_var.set(int(data.get("interval_seconds", 5)))
-        self.prefix_var.set(data.get("prefix", "auto"))
+        self.prefix_var.set(AUTO_COMMIT_PREFIX)
         self.enabled_var.set(bool(data.get("auto_commit_enabled", False)))
         self.push_history = list(data.get("push_history", []))[-5:]
         self.refresh_push_history()
@@ -1216,7 +1272,7 @@ class AutoCommitApp:
             "username": self.username_var.get().strip(),
             "email": self.email_var.get().strip(),
             "interval_seconds": int(self.interval_var.get()),
-            "prefix": self.prefix_var.get().strip() or "auto",
+            "prefix": AUTO_COMMIT_PREFIX,
             "auto_commit_enabled": bool(self.enabled_var.get()),
             "push_history": self.push_history[-5:],
         }
@@ -1415,7 +1471,7 @@ class AutoCommitApp:
         def work():
             self.set_busy(True)
             try:
-                with self.git_lock:
+                with self.repo_operation_lock(folder_path):
                     result = subprocess.run(
                         self.git_command("init"),
                         cwd=folder_path,
@@ -1554,7 +1610,7 @@ class AutoCommitApp:
         return repo_path
 
     def run_git(self, repo_path: Path, *args: str, check=True) -> subprocess.CompletedProcess:
-        with self.git_lock:
+        with self.repo_operation_lock(repo_path):
             return subprocess.run(
                 self.git_command(*args),
                 cwd=repo_path,
@@ -1570,8 +1626,38 @@ class AutoCommitApp:
         git_dir = repo_path / ".git"
         return any((git_dir / name).exists() for name in ("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "BISECT_LOG"))
 
-    def auto_commit_once(self, repo_path: Path, prefix: str) -> str | None:
-        with self.git_lock:
+    def get_next_commit_number(self, repo_path: Path) -> int:
+        result = subprocess.run(
+            self.git_command("rev-list", "--count", "HEAD"),
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            **self.get_subprocess_kwargs(),
+        )
+        if result.returncode != 0:
+            return 1
+        try:
+            return max(0, int(result.stdout.strip())) + 1
+        except ValueError:
+            return 1
+
+    def build_auto_commit_message(self, repo_path: Path, prefix: str) -> str:
+        commit_number = self.get_next_commit_number(repo_path)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        normalized_prefix = prefix.strip() or AUTO_COMMIT_PREFIX
+        return f"{normalized_prefix} {commit_number} {timestamp}"
+
+    def build_manual_commit_message(self, repo_path: Path, summary: str) -> str:
+        commit_number = self.get_next_commit_number(repo_path)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        normalized_summary = summary.strip() or "manual update"
+        return f"{normalized_summary} {commit_number} {timestamp}"
+
+    def commit_once(self, repo_path: Path, message: str | None = None, build_message=None) -> str | None:
+        with self.repo_operation_lock(repo_path):
             subprocess.run(
                 self.git_command("add", "-A"),
                 cwd=repo_path,
@@ -1596,7 +1682,10 @@ class AutoCommitApp:
                 return None
             if diff.returncode != 1:
                 raise RuntimeError(diff.stderr.strip() or "git diff --cached 鎵ц澶辫触")
-            message = f"{prefix}: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            if message is None:
+                if build_message is None:
+                    raise RuntimeError("缺少 commit message。")
+                message = build_message()
             result = subprocess.run(
                 self.git_command("commit", "-m", message),
                 cwd=repo_path,
@@ -1610,17 +1699,35 @@ class AutoCommitApp:
         self.write_log((result.stdout or result.stderr or "").strip() or ("已 commit：" + message))
         return message
 
+    def auto_commit_once(self, repo_path: Path, prefix: str) -> str | None:
+        return self.commit_once(repo_path, build_message=lambda: self.build_auto_commit_message(repo_path, prefix))
+
     def commit_now(self):
         repo_path = self.get_repo_path(show_errors=True)
         if not repo_path or self.busy:
             return
         self.ensure_gitignore_exists(repo_path)
+        summary = simpledialog.askstring(
+            "本次改动内容",
+            "请输入这次手动 Commit 的改动内容：",
+            parent=self.root,
+        )
+        if summary is None:
+            self.tip_var.set("已取消手动 Commit。")
+            return
+        summary = summary.strip()
+        if not summary:
+            messagebox.showerror("缺少提交内容", "请输入本次改动内容后再提交。")
+            return
 
         def work():
             self.set_busy(True)
             try:
                 self.write_log("准备手动 commit，目标仓库：" + str(repo_path))
-                commit_message = self.auto_commit_once(repo_path, self.prefix_var.get().strip() or "manual")
+                commit_message = self.commit_once(
+                    repo_path,
+                    build_message=lambda: self.build_manual_commit_message(repo_path, summary),
+                )
                 if not commit_message:
                     self.write_log("没有新的改动需要 commit。")
                     self.run_on_ui_thread(self.tip_var.set, "没有新的改动需要提交。")
