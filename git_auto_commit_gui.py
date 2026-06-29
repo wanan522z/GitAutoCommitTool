@@ -608,7 +608,10 @@ class AutoCommitApp:
         self.email_var = tk.StringVar()
         self.interval_var = tk.IntVar(value=5)
         self.prefix_var = tk.StringVar(value=AUTO_COMMIT_PREFIX)
-        self.push_history: list[str] = []
+        self.github_url_by_repo: dict[str, str] = {}
+        self.push_history_by_repo: dict[str, list[str]] = {}
+        self.folder_change_tracking_suspended = False
+        self.last_selected_folder = ""
 
         self.mode_var = tk.StringVar(value="空闲")
         self.switch_text_var = tk.StringVar(value="已关闭")
@@ -618,13 +621,16 @@ class AutoCommitApp:
         self.push_state_var = tk.StringVar(value="待 push：0 条 commit")
         self.tip_var = tk.StringVar(value="等待选择项目文件夹")
         self.push_history_var = tk.StringVar(value="暂无 push 记录")
-        self.commit_scope_mode = "all"
+        self.commit_scope_mode = "current"
         self.commit_scope_branch_ref: str | None = None
         self.commit_scope_current_label: str | None = None
         self.commit_scope_combo: ttk.Combobox | None = None
+        self.commit_scope_display_before_open = COMMIT_SCOPE_ALL_LABEL
+        self.commit_scope_dropdown_pending = False
 
         self.configure_style()
         self.build_ui()
+        self.folder_var.trace_add("write", self.on_folder_var_changed)
         self.rebuild_titlebar_buttons()
         for child in self.title_bar.winfo_children():
             if child not in (self.minimize_button, self.maximize_button, self.close_button):
@@ -637,6 +643,7 @@ class AutoCommitApp:
         self.root.after(140, self.refresh_taskbar_presence)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.bind("<Map>", self.on_root_map)
+        self.root.bind_all("<ButtonRelease-1>", self.on_global_mouse_release, add="+")
         self.request_status_refresh()
         self.root.after(250, self.restore_auto_commit_state)
 
@@ -660,7 +667,7 @@ class AutoCommitApp:
         self.last_commit_signature = []
         self.last_rendered_checkout_sha = None
         self.last_rendered_commit_empty = False
-        self.commit_scope_mode = "all"
+        self.commit_scope_mode = "current"
         self.commit_scope_branch_ref = None
         self.commit_scope_current_label = None
         self.commit_scope_var.set(COMMIT_SCOPE_ALL_LABEL)
@@ -672,6 +679,7 @@ class AutoCommitApp:
         self.worktree_var.set("工作区未连接")
         self.tip_var.set("正在读取当前项目状态...")
         self.push_state_var.set("待 push：0 条 commit")
+        self.refresh_push_history()
 
     def rebuild_titlebar_buttons(self):
         for button in (
@@ -955,7 +963,12 @@ class AutoCommitApp:
             style="Branch.TCombobox",
         )
         self.commit_scope_combo.grid(row=0, column=1, sticky="e")
+        self.commit_scope_combo.bind("<Button-1>", self.on_commit_scope_dropdown_open, add="+")
         self.commit_scope_combo.bind("<<ComboboxSelected>>", self.on_commit_scope_selected)
+        self.commit_scope_combo.bind("<FocusOut>", self.on_commit_scope_focus_out)
+        self.commit_scope_combo.bind("<MouseWheel>", lambda event: "break")
+        self.commit_scope_combo.bind("<Button-4>", lambda event: "break")
+        self.commit_scope_combo.bind("<Button-5>", lambda event: "break")
 
         self.commit_canvas = tk.Canvas(inner, bg=CARD_BG, highlightthickness=0, bd=0)
         self.commit_canvas.grid(row=1, column=0, sticky="nsew", pady=(14, 0))
@@ -1296,32 +1309,95 @@ class AutoCommitApp:
                     break
                 except Exception:
                     data = {}
-        self.folder_var.set(data.get("folder", ""))
-        self.github_var.set(self.normalize_github_url(data.get("github_url", "")))
+        raw_github_url_by_repo = data.get("github_url_by_repo", {})
+        if isinstance(raw_github_url_by_repo, dict):
+            self.github_url_by_repo = {
+                str(key): self.normalize_github_url(str(value))
+                for key, value in raw_github_url_by_repo.items()
+                if str(key).strip()
+            }
+        else:
+            self.github_url_by_repo = {}
         self.username_var.set(data.get("username", ""))
         self.email_var.set(data.get("email", ""))
         self.interval_var.set(int(data.get("interval_seconds", 5)))
         self.prefix_var.set(AUTO_COMMIT_PREFIX)
         self.enabled_var.set(bool(data.get("auto_commit_enabled", False)))
-        self.push_history = list(data.get("push_history", []))[-5:]
+        legacy_push_history = list(data.get("push_history", []))[-5:]
+        raw_push_history_by_repo = data.get("push_history_by_repo", {})
+        if isinstance(raw_push_history_by_repo, dict):
+            self.push_history_by_repo = {
+                str(key): list(value)[-5:]
+                for key, value in raw_push_history_by_repo.items()
+                if isinstance(value, list)
+            }
+        else:
+            self.push_history_by_repo = {}
+        folder = str(data.get("folder", "")).strip()
+        legacy_github_url = self.normalize_github_url(data.get("github_url", ""))
+        if legacy_github_url and folder:
+            repo_key = self.get_push_history_repo_key(Path(folder))
+            self.github_url_by_repo.setdefault(repo_key, legacy_github_url)
+        if legacy_push_history and folder:
+            repo_key = self.get_push_history_repo_key(Path(folder))
+            self.push_history_by_repo.setdefault(repo_key, legacy_push_history)
+        self.folder_change_tracking_suspended = True
+        self.folder_var.set(folder)
+        self.last_selected_folder = folder
+        self.github_var.set(self.get_github_url_for_repo(Path(folder)) if folder else "")
+        self.folder_change_tracking_suspended = False
         self.refresh_push_history()
 
     def save_config(self):
-        github_url = self.normalize_github_url(self.github_var.get())
+        self.remember_current_github_url()
+        github_url = self.get_github_url_for_repo()
         self.github_var.set(github_url)
         config_path = self.get_config_path()
         config_path.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "folder": self.folder_var.get().strip(),
             "github_url": github_url,
+            "github_url_by_repo": self.github_url_by_repo,
             "username": self.username_var.get().strip(),
             "email": self.email_var.get().strip(),
             "interval_seconds": int(self.interval_var.get()),
             "prefix": AUTO_COMMIT_PREFIX,
             "auto_commit_enabled": bool(self.enabled_var.get()),
-            "push_history": self.push_history[-5:],
+            "push_history": self.get_current_push_history(),
+            "push_history_by_repo": self.push_history_by_repo,
         }
         config_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def remember_current_github_url(self, folder: str | None = None):
+        candidate_folder = self.folder_var.get().strip() if folder is None else str(folder).strip()
+        if not candidate_folder:
+            return
+        repo_key = self.get_push_history_repo_key(Path(candidate_folder))
+        if not repo_key:
+            return
+        github_url = self.normalize_github_url(self.github_var.get())
+        if github_url:
+            self.github_url_by_repo[repo_key] = github_url
+        else:
+            self.github_url_by_repo.pop(repo_key, None)
+
+    def get_github_url_for_repo(self, repo_path: Path | None = None) -> str:
+        repo_key = self.get_push_history_repo_key(repo_path)
+        if not repo_key:
+            return ""
+        return self.normalize_github_url(self.github_url_by_repo.get(repo_key, ""))
+
+    def on_folder_var_changed(self, *_args):
+        if self.folder_change_tracking_suspended:
+            return
+        previous_folder = self.last_selected_folder.strip()
+        current_folder = self.folder_var.get().strip()
+        if previous_folder and previous_folder != current_folder:
+            self.remember_current_github_url(previous_folder)
+        next_github_url = self.get_github_url_for_repo(Path(current_folder)) if current_folder else ""
+        if self.github_var.get() != next_github_url:
+            self.github_var.set(next_github_url)
+        self.last_selected_folder = current_folder
 
     def verify_git_ready(self):
         try:
@@ -1350,6 +1426,7 @@ class AutoCommitApp:
             return
         self.folder_var.set(selected)
         self.identity_inputs_dirty = False
+        self.refresh_push_history()
         self.reset_repo_view_state()
         self.ensure_gitignore_exists(Path(selected))
         self.save_config()
@@ -1359,17 +1436,43 @@ class AutoCommitApp:
         self.identity_inputs_dirty = True
 
     def refresh_push_history(self):
-        if not self.push_history:
+        push_history = self.get_current_push_history()
+        if not push_history:
             self.push_history_var.set("暂无 push 记录")
             return
-        self.push_history_var.set("\n".join(self.push_history[-5:]))
+        self.push_history_var.set("\n".join(push_history[-5:]))
+
+    def on_folder_var_changed(self, *_args):
+        self.refresh_push_history()
 
     def append_push_history(self, message: str):
         timestamp = datetime.now().strftime("%m-%d %H:%M:%S")
-        self.push_history.append(f"{timestamp}  {message}")
-        self.push_history = self.push_history[-5:]
+        repo_key = self.get_push_history_repo_key()
+        if not repo_key:
+            return
+        history = self.push_history_by_repo.get(repo_key, [])
+        history.append(f"{timestamp}  {message}")
+        self.push_history_by_repo[repo_key] = history[-5:]
         self.refresh_push_history()
         self.save_config()
+
+    def get_push_history_repo_key(self, repo_path: Path | None = None) -> str:
+        candidate = repo_path
+        if candidate is None:
+            folder = self.folder_var.get().strip()
+            if not folder:
+                return ""
+            candidate = Path(folder)
+        try:
+            return str(candidate.resolve()).lower()
+        except Exception:
+            return str(candidate).lower()
+
+    def get_current_push_history(self) -> list[str]:
+        repo_key = self.get_push_history_repo_key()
+        if not repo_key:
+            return []
+        return list(self.push_history_by_repo.get(repo_key, []))[-5:]
 
     def run_on_ui_thread(self, callback, *args, **kwargs):
         if threading.current_thread() is threading.main_thread():
@@ -1445,8 +1548,46 @@ class AutoCommitApp:
         else:
             self.commit_scope_mode = "branch"
             self.commit_scope_branch_ref = label or None
+        self.commit_scope_display_before_open = label or (self.commit_scope_current_label or COMMIT_SCOPE_ALL_LABEL)
+        self.commit_scope_dropdown_pending = False
         self.invalidate_commit_list_cache()
         self.request_status_refresh(force=True)
+
+    def on_commit_scope_dropdown_open(self, _event=None):
+        current_label = self.commit_scope_var.get().strip()
+        if not current_label:
+            current_label = self.commit_scope_current_label or COMMIT_SCOPE_ALL_LABEL
+        self.commit_scope_display_before_open = current_label
+        self.commit_scope_dropdown_pending = True
+
+    def on_commit_scope_focus_out(self, _event=None):
+        if self.commit_scope_combo is None or not self.commit_scope_combo.winfo_exists():
+            return
+        self.root.after_idle(self.finish_commit_scope_interaction)
+
+    def on_global_mouse_release(self, _event=None):
+        if self.commit_scope_dropdown_pending:
+            self.root.after_idle(self.finish_commit_scope_interaction)
+
+    def set_commit_scope_display(self, value: str):
+        normalized_value = (value or "").strip() or COMMIT_SCOPE_ALL_LABEL
+        self.commit_scope_var.set(normalized_value)
+        if self.commit_scope_combo is not None and self.commit_scope_combo.winfo_exists():
+            self.commit_scope_combo.set(normalized_value)
+
+    def finish_commit_scope_interaction(self):
+        if self.commit_scope_combo is None or not self.commit_scope_combo.winfo_exists():
+            self.commit_scope_dropdown_pending = False
+            return
+        current_value = self.commit_scope_var.get().strip()
+        options = tuple(self.commit_scope_combo.cget("values"))
+        if current_value and current_value in options:
+            self.commit_scope_display_before_open = current_value
+            self.set_commit_scope_display(current_value)
+            self.commit_scope_dropdown_pending = False
+            return
+        self.restore_commit_scope_display()
+        self.commit_scope_dropdown_pending = False
 
     def format_push_error_message(self, output: str) -> str:
         detail = (output or "").strip()
@@ -1731,12 +1872,13 @@ class AutoCommitApp:
                 options.append(branch)
 
         self.commit_scope_current_label = current_label
-        selected_label = COMMIT_SCOPE_ALL_LABEL
+        selected_label = current_label or COMMIT_SCOPE_ALL_LABEL
         if self.commit_scope_mode == "current":
             if current_label:
                 selected_label = current_label
             else:
                 self.commit_scope_mode = "all"
+                selected_label = COMMIT_SCOPE_ALL_LABEL
         elif self.commit_scope_mode == "branch":
             selected_branch = self.commit_scope_branch_ref or ""
             if selected_branch == current_branch and current_label:
@@ -1744,12 +1886,30 @@ class AutoCommitApp:
             elif selected_branch in options:
                 selected_label = selected_branch
             else:
-                self.commit_scope_mode = "all"
+                self.commit_scope_mode = "current" if current_label else "all"
                 self.commit_scope_branch_ref = None
+                selected_label = current_label or COMMIT_SCOPE_ALL_LABEL
+        elif self.commit_scope_mode == "all":
+            selected_label = COMMIT_SCOPE_ALL_LABEL
 
         if self.commit_scope_combo is not None and self.commit_scope_combo.winfo_exists():
             self.commit_scope_combo.configure(values=options)
-        self.commit_scope_var.set(selected_label)
+        self.set_commit_scope_display(selected_label)
+
+    def restore_commit_scope_display(self):
+        previous_display = (self.commit_scope_display_before_open or "").strip()
+        if self.commit_scope_combo is not None and self.commit_scope_combo.winfo_exists():
+            options = tuple(self.commit_scope_combo.cget("values"))
+            if previous_display and previous_display in options:
+                self.set_commit_scope_display(previous_display)
+                return
+        if self.commit_scope_mode == "all":
+            self.set_commit_scope_display(COMMIT_SCOPE_ALL_LABEL)
+            return
+        if self.commit_scope_mode == "branch" and self.commit_scope_branch_ref:
+            self.set_commit_scope_display(self.commit_scope_branch_ref)
+            return
+        self.set_commit_scope_display(self.commit_scope_current_label or COMMIT_SCOPE_ALL_LABEL)
 
     def get_current_commit_number(self, repo_path: Path) -> int:
         result = subprocess.run(
@@ -1782,15 +1942,22 @@ class AutoCommitApp:
         preset_label = (preset_label or "").strip()
         if preset_label == MANUAL_COMMIT_CUSTOM_PREFIX_LABEL:
             return (custom_prefix or "").strip()
-        for value, _label in MANUAL_COMMIT_PREFIX_OPTIONS:
-            if preset_label == value:
+        for value, label in MANUAL_COMMIT_PREFIX_OPTIONS:
+            if preset_label in (value, self.format_manual_commit_prefix_label(value, label)):
                 return value
         return preset_label
 
-    def build_manual_commit_message(self, prefix: str, title: str, body: str) -> str:
+    def format_manual_commit_prefix_label(self, value: str, label: str) -> str:
+        return f"{value}（{label}）"
+
+    def build_manual_commit_message(self, prefix: str, scope: str, title: str, body: str) -> str:
         normalized_prefix = (prefix or "").strip() or "chore"
+        normalized_scope = (scope or "").strip()
         normalized_title = (title or "").strip() or "manual update"
-        subject = f"{normalized_prefix}: {normalized_title}"
+        if normalized_scope:
+            subject = f"{normalized_prefix}({normalized_scope}): {normalized_title}"
+        else:
+            subject = f"{normalized_prefix}: {normalized_title}"
         normalized_body = (body or "").strip()
         if not normalized_body:
             return subject
@@ -1804,11 +1971,13 @@ class AutoCommitApp:
         dialog.transient(self.root)
         dialog.columnconfigure(0, weight=1)
         dialog.rowconfigure(1, weight=1)
-        self._size_toplevel(dialog, 980, 520)
+        self._size_toplevel(dialog, 980, 1080)
+        dialog.minsize(900, 860)
 
-        prefix_values = [item[0] for item in MANUAL_COMMIT_PREFIX_OPTIONS] + [MANUAL_COMMIT_CUSTOM_PREFIX_LABEL]
-        prefix_var = tk.StringVar(value="fix")
+        prefix_values = [self.format_manual_commit_prefix_label(value, label) for value, label in MANUAL_COMMIT_PREFIX_OPTIONS]
+        prefix_var = tk.StringVar(value=self.format_manual_commit_prefix_label("fix", "修复问题"))
         custom_prefix_var = tk.StringVar()
+        scope_var = tk.StringVar()
         title_var = tk.StringVar()
 
         top = tk.Frame(dialog, bg=WINDOW)
@@ -1817,7 +1986,7 @@ class AutoCommitApp:
         tk.Label(top, text="手动 Commit", bg=WINDOW, fg=TEXT, font=F_CARD_TITLE).grid(row=0, column=0, sticky="w")
         tk.Label(
             top,
-            text="左侧填写标题并选择前缀，右侧可补充详细内容。",
+            text="上方填写 type、scope、title，下方可补充详细内容。",
             bg=WINDOW,
             fg=TEXT_MUTED,
             font=F_MUTED,
@@ -1825,53 +1994,59 @@ class AutoCommitApp:
 
         body = tk.Frame(dialog, bg=WINDOW)
         body.grid(row=1, column=0, sticky="nsew", padx=20, pady=18)
-        body.columnconfigure(0, weight=11, uniform="manual_commit")
-        body.columnconfigure(1, weight=14, uniform="manual_commit")
-        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(1, weight=1)
 
-        left_card = RoundedCard(body, radius=16, padding=18)
-        left_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        left_inner = left_card.inner
-        left_inner.columnconfigure(0, weight=1)
-        left_inner.columnconfigure(1, weight=1)
-        tk.Label(left_inner, text="标题", bg=CARD_BG, fg=TEXT, font=F_CARD_TITLE).grid(row=0, column=0, columnspan=2, sticky="w")
-        tk.Label(left_inner, text="提交标题会出现在 commit 第一行。", bg=CARD_BG, fg=TEXT_MUTED,
+        top_card = RoundedCard(body, radius=16, padding=18)
+        top_card.grid(row=0, column=0, sticky="ew")
+        top_inner = top_card.inner
+        top_inner.columnconfigure(0, weight=1)
+        top_inner.columnconfigure(1, weight=1)
+        tk.Label(top_inner, text="标题区", bg=CARD_BG, fg=TEXT, font=F_CARD_TITLE).grid(row=0, column=0, columnspan=2, sticky="w")
+        tk.Label(top_inner, text="会按 type(scope): title 生成首行；scope 可留空。", bg=CARD_BG, fg=TEXT_MUTED,
                  font=F_MUTED).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 12))
 
-        prefix_row = tk.Frame(left_inner, bg=CARD_BG)
+        prefix_row = tk.Frame(top_inner, bg=CARD_BG)
         prefix_row.grid(row=2, column=0, columnspan=2, sticky="ew")
-        prefix_row.columnconfigure(2, weight=1)
-        tk.Label(prefix_row, text="前缀", bg=CARD_BG, fg=TEXT_MUTED, font=F_MUTED).grid(row=0, column=0, sticky="w", padx=(0, 10))
+        prefix_row.columnconfigure(3, weight=1)
+        tk.Label(prefix_row, text="Type", bg=CARD_BG, fg=TEXT_MUTED, font=F_MUTED).grid(row=0, column=0, sticky="w", padx=(0, 10))
         prefix_combo = ttk.Combobox(
             prefix_row,
             textvariable=prefix_var,
-            values=prefix_values,
+            values=tuple(prefix_values + [MANUAL_COMMIT_CUSTOM_PREFIX_LABEL]),
             state="readonly",
-            width=10,
+            width=14,
             style="Branch.TCombobox",
         )
         prefix_combo.grid(row=0, column=1, sticky="w")
+        tk.Label(prefix_row, text="自定义前缀", bg=CARD_BG, fg=TEXT_MUTED, font=F_MUTED).grid(row=0, column=2, sticky="w", padx=(14, 10))
         custom_prefix_entry = ttk.Entry(prefix_row, textvariable=custom_prefix_var, width=12)
-        custom_prefix_entry.grid(row=0, column=2, sticky="ew", padx=(10, 0))
+        custom_prefix_entry.grid(row=0, column=3, sticky="ew")
+        tk.Label(prefix_row, text="Scope", bg=CARD_BG, fg=TEXT_MUTED, font=F_MUTED).grid(row=1, column=0, sticky="w", padx=(0, 10), pady=(10, 0))
+        scope_entry = ttk.Entry(prefix_row, textvariable=scope_var, width=16)
+        scope_entry.grid(row=1, column=1, columnspan=3, sticky="ew", pady=(10, 0))
 
-        tk.Label(left_inner, text="标题内容", bg=CARD_BG, fg=TEXT_MUTED, font=F_MUTED).grid(row=3, column=0, columnspan=2, sticky="w", pady=(16, 6))
-        title_entry = ttk.Entry(left_inner, textvariable=title_var)
-        title_entry.grid(row=4, column=0, columnspan=2, sticky="ew")
+        title_row = tk.Frame(top_inner, bg=CARD_BG)
+        title_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        title_row.columnconfigure(1, weight=1)
+        tk.Label(title_row, text="Title", bg=CARD_BG, fg=TEXT_MUTED, font=F_MUTED).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        title_entry = ttk.Entry(title_row, textvariable=title_var)
+        title_entry.grid(row=0, column=1, sticky="ew")
 
         preset_hint = tk.StringVar()
-        hint_label = tk.Label(left_inner, textvariable=preset_hint, bg=CARD_BG, fg=TEXT_FAINT, font=F_MUTED, justify="left")
-        hint_label.grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        hint_label = tk.Label(top_inner, textvariable=preset_hint, bg=CARD_BG, fg=TEXT_FAINT, font=F_MUTED, justify="left")
+        hint_label.grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
-        right_card = RoundedCard(body, radius=16, padding=18)
-        right_card.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
-        right_inner = right_card.inner
-        right_inner.columnconfigure(0, weight=1)
-        right_inner.rowconfigure(2, weight=1)
-        tk.Label(right_inner, text="内容", bg=CARD_BG, fg=TEXT, font=F_CARD_TITLE).grid(row=0, column=0, sticky="w")
-        tk.Label(right_inner, text="可选。这里会写入 commit body，适合补充变更细节。", bg=CARD_BG, fg=TEXT_MUTED,
+        bottom_card = RoundedCard(body, radius=16, padding=18)
+        bottom_card.grid(row=1, column=0, sticky="nsew", pady=(16, 0))
+        bottom_inner = bottom_card.inner
+        bottom_inner.columnconfigure(0, weight=1)
+        bottom_inner.rowconfigure(2, weight=1)
+        tk.Label(bottom_inner, text="内容", bg=CARD_BG, fg=TEXT, font=F_CARD_TITLE).grid(row=0, column=0, sticky="w")
+        tk.Label(bottom_inner, text="可选。这里会写入 commit body，适合补充变更细节。", bg=CARD_BG, fg=TEXT_MUTED,
                  font=F_MUTED).grid(row=1, column=0, sticky="w", pady=(4, 12))
         content_text = tk.Text(
-            right_inner,
+            bottom_inner,
             wrap="word",
             bg=INPUT_BG,
             fg=TEXT,
@@ -1900,7 +2075,7 @@ class AutoCommitApp:
             is_custom = selected == MANUAL_COMMIT_CUSTOM_PREFIX_LABEL
             if is_custom:
                 custom_prefix_entry.configure(state="normal")
-                preset_hint.set("自定义前缀会和标题拼成例如：mytype: 调整提交样式")
+                preset_hint.set("自定义 type 只用于生成英文提交头，例如：mytype(scope): 调整提交样式")
                 if not custom_prefix_var.get().strip():
                     custom_prefix_var.set("custom")
             else:
@@ -1908,7 +2083,7 @@ class AutoCommitApp:
                 custom_prefix_var.set("")
                 hint_text = ""
                 for value, label in MANUAL_COMMIT_PREFIX_OPTIONS:
-                    if value == selected:
+                    if selected == self.format_manual_commit_prefix_label(value, label):
                         hint_text = f"{value}: {label}"
                         break
                 preset_hint.set(hint_text)
@@ -1926,6 +2101,7 @@ class AutoCommitApp:
                 return
             result = {
                 "prefix": prefix_text,
+                "scope": scope_var.get().strip(),
                 "title": title_text,
                 "body": body_text,
             }
@@ -2027,6 +2203,7 @@ class AutoCommitApp:
                     repo_path,
                     build_message=lambda: self.build_manual_commit_message(
                         manual_commit["prefix"],
+                        manual_commit["scope"],
                         manual_commit["title"],
                         manual_commit["body"],
                     ),
@@ -2037,6 +2214,7 @@ class AutoCommitApp:
                             repo_path,
                             self.build_manual_commit_message(
                                 manual_commit["prefix"],
+                                manual_commit["scope"],
                                 manual_commit["title"],
                                 manual_commit["body"],
                             ),
