@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 try:
     import msvcrt
@@ -27,6 +27,21 @@ CONFIG_FILENAME = "git_auto_commit_gui_config.json"
 LOG_FILENAME = "git_auto_commit_gui.log"
 APP_STORAGE_DIRNAME = "GitAutoCommitTool"
 AUTO_COMMIT_PREFIX = "auto snapshot"
+COMMIT_SCOPE_ALL_LABEL = "全部分支"
+MANUAL_COMMIT_PREFIX_OPTIONS = [
+    ("fix", "修复问题"),
+    ("feat", "新功能"),
+    ("perf", "性能优化"),
+    ("refactor", "代码重构"),
+    ("docs", "文档更新"),
+    ("style", "样式整理"),
+    ("test", "测试补充"),
+    ("chore", "杂项维护"),
+    ("build", "构建调整"),
+    ("ci", "持续集成"),
+    ("revert", "回退变更"),
+]
+MANUAL_COMMIT_CUSTOM_PREFIX_LABEL = "自定义"
 
 # --- 鐧借壊鐜颁唬涓婚閰嶈壊 ---
 WINDOW = "#E9EEF6"        # 绐楀彛搴曡壊锛堜細琚涓洪€忔槑鑹诧紝闇插嚭浜氬厠鍔涙ā绯婏級
@@ -502,6 +517,7 @@ class CommitItem:
 class RepoSnapshot:
     branch: str
     branch_state: str
+    local_branches: list[str]
     ahead: int
     behind: int
     dirty: bool
@@ -597,10 +613,15 @@ class AutoCommitApp:
         self.mode_var = tk.StringVar(value="空闲")
         self.switch_text_var = tk.StringVar(value="已关闭")
         self.branch_var = tk.StringVar(value="branch -")
+        self.commit_scope_var = tk.StringVar(value=COMMIT_SCOPE_ALL_LABEL)
         self.worktree_var = tk.StringVar(value="工作区未连接")
         self.push_state_var = tk.StringVar(value="待 push：0 条 commit")
         self.tip_var = tk.StringVar(value="等待选择项目文件夹")
         self.push_history_var = tk.StringVar(value="暂无 push 记录")
+        self.commit_scope_mode = "all"
+        self.commit_scope_branch_ref: str | None = None
+        self.commit_scope_current_label: str | None = None
+        self.commit_scope_combo: ttk.Combobox | None = None
 
         self.configure_style()
         self.build_ui()
@@ -639,6 +660,12 @@ class AutoCommitApp:
         self.last_commit_signature = []
         self.last_rendered_checkout_sha = None
         self.last_rendered_commit_empty = False
+        self.commit_scope_mode = "all"
+        self.commit_scope_branch_ref = None
+        self.commit_scope_current_label = None
+        self.commit_scope_var.set(COMMIT_SCOPE_ALL_LABEL)
+        if self.commit_scope_combo is not None and self.commit_scope_combo.winfo_exists():
+            self.commit_scope_combo.configure(values=(COMMIT_SCOPE_ALL_LABEL,))
         self.clear_commit_rows()
         self.show_empty_commit_row()
         self.branch_var.set("branch -")
@@ -693,6 +720,16 @@ class AutoCommitApp:
                         arrowsize=16, padding=11, arrowcolor=TEXT_MUTED, font=F_LABEL)
         style.map("TSpinbox", bordercolor=[("focus", ACCENT)], lightcolor=[("focus", ACCENT)],
                   darkcolor=[("focus", ACCENT)])
+        style.configure("Branch.TCombobox", foreground=TEXT_MUTED, fieldbackground=INPUT_BG,
+                        background=INPUT_BG, bordercolor=INPUT_BORDER, lightcolor=INPUT_BORDER,
+                        darkcolor=INPUT_BORDER, arrowcolor=TEXT_MUTED, padding=8, font=F_MUTED)
+        style.map("Branch.TCombobox",
+                  bordercolor=[("readonly", INPUT_BORDER), ("focus", ACCENT)],
+                  lightcolor=[("readonly", INPUT_BORDER), ("focus", ACCENT)],
+                  darkcolor=[("readonly", INPUT_BORDER), ("focus", ACCENT)],
+                  fieldbackground=[("readonly", INPUT_BG)],
+                  selectbackground=[("readonly", INPUT_BG)],
+                  selectforeground=[("readonly", TEXT_MUTED)])
         style.configure("Vertical.TScrollbar", background=CARD_BORDER, troughcolor=CARD_BG,
                         bordercolor=CARD_BG, arrowcolor=TEXT_MUTED, gripcount=0, arrowsize=16)
         style.configure("Horizontal.TScrollbar", background=CARD_BORDER, troughcolor=CARD_BG,
@@ -909,8 +946,16 @@ class AutoCommitApp:
         head.columnconfigure(0, weight=1)
         tk.Label(head, text="Commit 记录", bg=CARD_BG, fg=TEXT,
                 font=F_CARD_TITLE).grid(row=0, column=0, sticky="w")
-        tk.Label(head, textvariable=self.branch_var, bg=CARD_BG, fg=TEXT_MUTED,
-                font=F_MUTED).grid(row=0, column=1, sticky="e")
+        self.commit_scope_combo = ttk.Combobox(
+            head,
+            textvariable=self.commit_scope_var,
+            state="readonly",
+            values=(COMMIT_SCOPE_ALL_LABEL,),
+            width=22,
+            style="Branch.TCombobox",
+        )
+        self.commit_scope_combo.grid(row=0, column=1, sticky="e")
+        self.commit_scope_combo.bind("<<ComboboxSelected>>", self.on_commit_scope_selected)
 
         self.commit_canvas = tk.Canvas(inner, bg=CARD_BG, highlightthickness=0, bd=0)
         self.commit_canvas.grid(row=1, column=0, sticky="nsew", pady=(14, 0))
@@ -1389,6 +1434,20 @@ class AutoCommitApp:
     def show_info_async(self, title: str, message: str):
         self.run_on_ui_thread(messagebox.showinfo, title, message)
 
+    def on_commit_scope_selected(self, _event=None):
+        label = self.commit_scope_var.get().strip()
+        if label == COMMIT_SCOPE_ALL_LABEL:
+            self.commit_scope_mode = "all"
+            self.commit_scope_branch_ref = None
+        elif self.commit_scope_current_label and label == self.commit_scope_current_label:
+            self.commit_scope_mode = "current"
+            self.commit_scope_branch_ref = None
+        else:
+            self.commit_scope_mode = "branch"
+            self.commit_scope_branch_ref = label or None
+        self.invalidate_commit_list_cache()
+        self.request_status_refresh(force=True)
+
     def format_push_error_message(self, output: str) -> str:
         detail = (output or "").strip()
         if not detail:
@@ -1626,7 +1685,73 @@ class AutoCommitApp:
         git_dir = repo_path / ".git"
         return any((git_dir / name).exists() for name in ("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "BISECT_LOG"))
 
-    def get_next_commit_number(self, repo_path: Path) -> int:
+    def has_commit_history(self, repo_path: Path) -> bool:
+        result = subprocess.run(
+            self.git_command("rev-parse", "--verify", "HEAD"),
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            **self.get_subprocess_kwargs(),
+        )
+        return result.returncode == 0
+
+    def list_local_branches(self, repo_path: Path) -> list[str]:
+        result = self.run_git(
+            repo_path,
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads",
+            check=False,
+        )
+        if result.returncode != 0:
+            return []
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    def get_commit_scope_log_args(self, repo_path: Path) -> list[str]:
+        if self.commit_scope_mode == "all":
+            return ["--all"]
+        if self.commit_scope_mode == "branch" and self.commit_scope_branch_ref:
+            return [self.commit_scope_branch_ref]
+        current_branch = self.run_git(repo_path, "branch", "--show-current", check=False).stdout.strip()
+        if current_branch:
+            return [current_branch]
+        return ["HEAD"]
+
+    def update_commit_scope_options(self, current_branch: str, local_branches: list[str]):
+        options = [COMMIT_SCOPE_ALL_LABEL]
+        current_label = None
+        if current_branch:
+            current_label = f"当前分支：{current_branch}"
+            options.append(current_label)
+        for branch in local_branches:
+            if branch != current_branch:
+                options.append(branch)
+
+        self.commit_scope_current_label = current_label
+        selected_label = COMMIT_SCOPE_ALL_LABEL
+        if self.commit_scope_mode == "current":
+            if current_label:
+                selected_label = current_label
+            else:
+                self.commit_scope_mode = "all"
+        elif self.commit_scope_mode == "branch":
+            selected_branch = self.commit_scope_branch_ref or ""
+            if selected_branch == current_branch and current_label:
+                selected_label = current_label
+            elif selected_branch in options:
+                selected_label = selected_branch
+            else:
+                self.commit_scope_mode = "all"
+                self.commit_scope_branch_ref = None
+
+        if self.commit_scope_combo is not None and self.commit_scope_combo.winfo_exists():
+            self.commit_scope_combo.configure(values=options)
+        self.commit_scope_var.set(selected_label)
+
+    def get_current_commit_number(self, repo_path: Path) -> int:
         result = subprocess.run(
             self.git_command("rev-list", "--count", "HEAD"),
             cwd=repo_path,
@@ -1638,11 +1763,14 @@ class AutoCommitApp:
             **self.get_subprocess_kwargs(),
         )
         if result.returncode != 0:
-            return 1
+            return 0
         try:
-            return max(0, int(result.stdout.strip())) + 1
+            return max(0, int(result.stdout.strip()))
         except ValueError:
-            return 1
+            return 0
+
+    def get_next_commit_number(self, repo_path: Path) -> int:
+        return self.get_current_commit_number(repo_path) + 1
 
     def build_auto_commit_message(self, repo_path: Path, prefix: str) -> str:
         commit_number = self.get_next_commit_number(repo_path)
@@ -1650,11 +1778,190 @@ class AutoCommitApp:
         normalized_prefix = prefix.strip() or AUTO_COMMIT_PREFIX
         return f"{normalized_prefix} {commit_number} {timestamp}"
 
-    def build_manual_commit_message(self, repo_path: Path, summary: str) -> str:
-        commit_number = self.get_next_commit_number(repo_path)
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        normalized_summary = summary.strip() or "manual update"
-        return f"{normalized_summary} {commit_number} {timestamp}"
+    def normalize_manual_commit_prefix(self, preset_label: str, custom_prefix: str) -> str:
+        preset_label = (preset_label or "").strip()
+        if preset_label == MANUAL_COMMIT_CUSTOM_PREFIX_LABEL:
+            return (custom_prefix or "").strip()
+        for value, _label in MANUAL_COMMIT_PREFIX_OPTIONS:
+            if preset_label == value:
+                return value
+        return preset_label
+
+    def build_manual_commit_message(self, prefix: str, title: str, body: str) -> str:
+        normalized_prefix = (prefix or "").strip() or "chore"
+        normalized_title = (title or "").strip() or "manual update"
+        subject = f"{normalized_prefix}: {normalized_title}"
+        normalized_body = (body or "").strip()
+        if not normalized_body:
+            return subject
+        return subject + "\n\n" + normalized_body
+
+    def prompt_manual_commit_form(self) -> dict[str, str] | None:
+        result: dict[str, str] | None = None
+        dialog = tk.Toplevel(self.root)
+        dialog.title("手动 Commit")
+        dialog.configure(bg=WINDOW)
+        dialog.transient(self.root)
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(1, weight=1)
+        self._size_toplevel(dialog, 980, 520)
+
+        prefix_values = [item[0] for item in MANUAL_COMMIT_PREFIX_OPTIONS] + [MANUAL_COMMIT_CUSTOM_PREFIX_LABEL]
+        prefix_var = tk.StringVar(value="fix")
+        custom_prefix_var = tk.StringVar()
+        title_var = tk.StringVar()
+
+        top = tk.Frame(dialog, bg=WINDOW)
+        top.grid(row=0, column=0, sticky="ew", padx=20, pady=(18, 0))
+        top.columnconfigure(0, weight=1)
+        tk.Label(top, text="手动 Commit", bg=WINDOW, fg=TEXT, font=F_CARD_TITLE).grid(row=0, column=0, sticky="w")
+        tk.Label(
+            top,
+            text="左侧填写标题并选择前缀，右侧可补充详细内容。",
+            bg=WINDOW,
+            fg=TEXT_MUTED,
+            font=F_MUTED,
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+        body = tk.Frame(dialog, bg=WINDOW)
+        body.grid(row=1, column=0, sticky="nsew", padx=20, pady=18)
+        body.columnconfigure(0, weight=11, uniform="manual_commit")
+        body.columnconfigure(1, weight=14, uniform="manual_commit")
+        body.rowconfigure(0, weight=1)
+
+        left_card = RoundedCard(body, radius=16, padding=18)
+        left_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        left_inner = left_card.inner
+        left_inner.columnconfigure(0, weight=1)
+        left_inner.columnconfigure(1, weight=1)
+        tk.Label(left_inner, text="标题", bg=CARD_BG, fg=TEXT, font=F_CARD_TITLE).grid(row=0, column=0, columnspan=2, sticky="w")
+        tk.Label(left_inner, text="提交标题会出现在 commit 第一行。", bg=CARD_BG, fg=TEXT_MUTED,
+                 font=F_MUTED).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 12))
+
+        prefix_row = tk.Frame(left_inner, bg=CARD_BG)
+        prefix_row.grid(row=2, column=0, columnspan=2, sticky="ew")
+        prefix_row.columnconfigure(2, weight=1)
+        tk.Label(prefix_row, text="前缀", bg=CARD_BG, fg=TEXT_MUTED, font=F_MUTED).grid(row=0, column=0, sticky="w", padx=(0, 10))
+        prefix_combo = ttk.Combobox(
+            prefix_row,
+            textvariable=prefix_var,
+            values=prefix_values,
+            state="readonly",
+            width=10,
+            style="Branch.TCombobox",
+        )
+        prefix_combo.grid(row=0, column=1, sticky="w")
+        custom_prefix_entry = ttk.Entry(prefix_row, textvariable=custom_prefix_var, width=12)
+        custom_prefix_entry.grid(row=0, column=2, sticky="ew", padx=(10, 0))
+
+        tk.Label(left_inner, text="标题内容", bg=CARD_BG, fg=TEXT_MUTED, font=F_MUTED).grid(row=3, column=0, columnspan=2, sticky="w", pady=(16, 6))
+        title_entry = ttk.Entry(left_inner, textvariable=title_var)
+        title_entry.grid(row=4, column=0, columnspan=2, sticky="ew")
+
+        preset_hint = tk.StringVar()
+        hint_label = tk.Label(left_inner, textvariable=preset_hint, bg=CARD_BG, fg=TEXT_FAINT, font=F_MUTED, justify="left")
+        hint_label.grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        right_card = RoundedCard(body, radius=16, padding=18)
+        right_card.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        right_inner = right_card.inner
+        right_inner.columnconfigure(0, weight=1)
+        right_inner.rowconfigure(2, weight=1)
+        tk.Label(right_inner, text="内容", bg=CARD_BG, fg=TEXT, font=F_CARD_TITLE).grid(row=0, column=0, sticky="w")
+        tk.Label(right_inner, text="可选。这里会写入 commit body，适合补充变更细节。", bg=CARD_BG, fg=TEXT_MUTED,
+                 font=F_MUTED).grid(row=1, column=0, sticky="w", pady=(4, 12))
+        content_text = tk.Text(
+            right_inner,
+            wrap="word",
+            bg=INPUT_BG,
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief="flat",
+            borderwidth=1,
+            highlightthickness=1,
+            highlightbackground=INPUT_BORDER,
+            highlightcolor=ACCENT,
+            font=F_BODY,
+            padx=12,
+            pady=12,
+        )
+        content_text.grid(row=2, column=0, sticky="nsew")
+
+        footer = tk.Frame(dialog, bg=WINDOW)
+        footer.grid(row=2, column=0, sticky="e", padx=20, pady=(0, 18))
+        cancel_btn = ModernButton(
+            footer, text="取消", command=lambda: dialog.destroy(), variant="ghost",
+            radius=12, font=F_BUTTON_SM, height=38, width=96,
+        )
+        cancel_btn.grid(row=0, column=0, padx=(0, 10))
+
+        def update_prefix_state(_event=None):
+            selected = prefix_var.get().strip()
+            is_custom = selected == MANUAL_COMMIT_CUSTOM_PREFIX_LABEL
+            if is_custom:
+                custom_prefix_entry.configure(state="normal")
+                preset_hint.set("自定义前缀会和标题拼成例如：mytype: 调整提交样式")
+                if not custom_prefix_var.get().strip():
+                    custom_prefix_var.set("custom")
+            else:
+                custom_prefix_entry.configure(state="disabled")
+                custom_prefix_var.set("")
+                hint_text = ""
+                for value, label in MANUAL_COMMIT_PREFIX_OPTIONS:
+                    if value == selected:
+                        hint_text = f"{value}: {label}"
+                        break
+                preset_hint.set(hint_text)
+
+        def submit():
+            nonlocal result
+            prefix_text = self.normalize_manual_commit_prefix(prefix_var.get(), custom_prefix_var.get())
+            title_text = title_var.get().strip()
+            body_text = content_text.get("1.0", "end").strip()
+            if not prefix_text:
+                messagebox.showerror("缺少前缀", "请选择一个提交前缀，或输入自定义前缀。", parent=dialog)
+                return
+            if not title_text:
+                messagebox.showerror("缺少标题", "请先填写手动 Commit 的标题。", parent=dialog)
+                return
+            result = {
+                "prefix": prefix_text,
+                "title": title_text,
+                "body": body_text,
+            }
+            dialog.destroy()
+
+        submit_btn = ModernButton(
+            footer, text="提交", command=submit, variant="secondary",
+            radius=12, font=F_BUTTON_SM, height=38, width=108,
+        )
+        submit_btn.grid(row=0, column=1)
+
+        prefix_combo.bind("<<ComboboxSelected>>", update_prefix_state)
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        update_prefix_state()
+        dialog.grab_set()
+        title_entry.focus_set()
+        self.root.wait_window(dialog)
+        return result
+
+    def rename_last_commit(self, repo_path: Path, message: str) -> str:
+        if not self.has_commit_history(repo_path):
+            raise RuntimeError("当前仓库还没有任何提交，无法重命名最近一次 commit。")
+        with self.repo_operation_lock(repo_path):
+            result = subprocess.run(
+                self.git_command("commit", "--amend", "-m", message),
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+                **self.get_subprocess_kwargs(),
+            )
+        self.write_log((result.stdout or result.stderr or "").strip() or ("已重命名最近一次 commit：" + message))
+        return message
 
     def commit_once(self, repo_path: Path, message: str | None = None, build_message=None) -> str | None:
         with self.repo_operation_lock(repo_path):
@@ -1707,17 +2014,9 @@ class AutoCommitApp:
         if not repo_path or self.busy:
             return
         self.ensure_gitignore_exists(repo_path)
-        summary = simpledialog.askstring(
-            "本次改动内容",
-            "请输入这次手动 Commit 的改动内容：",
-            parent=self.root,
-        )
-        if summary is None:
+        manual_commit = self.prompt_manual_commit_form()
+        if manual_commit is None:
             self.tip_var.set("已取消手动 Commit。")
-            return
-        summary = summary.strip()
-        if not summary:
-            messagebox.showerror("缺少提交内容", "请输入本次改动内容后再提交。")
             return
 
         def work():
@@ -1726,13 +2025,31 @@ class AutoCommitApp:
                 self.write_log("准备手动 commit，目标仓库：" + str(repo_path))
                 commit_message = self.commit_once(
                     repo_path,
-                    build_message=lambda: self.build_manual_commit_message(repo_path, summary),
+                    build_message=lambda: self.build_manual_commit_message(
+                        manual_commit["prefix"],
+                        manual_commit["title"],
+                        manual_commit["body"],
+                    ),
                 )
                 if not commit_message:
-                    self.write_log("没有新的改动需要 commit。")
-                    self.run_on_ui_thread(self.tip_var.set, "没有新的改动需要提交。")
-                    self.show_info_async("没有新的改动", "这次没有检测到新的改动，所以没有生成 commit。")
+                    if self.has_commit_history(repo_path):
+                        renamed_message = self.rename_last_commit(
+                            repo_path,
+                            self.build_manual_commit_message(
+                                manual_commit["prefix"],
+                                manual_commit["title"],
+                                manual_commit["body"],
+                            ),
+                        )
+                        self.run_on_ui_thread(self.invalidate_commit_list_cache)
+                        self.run_on_ui_thread(self.tip_var.set, "没有新改动，已重命名最近一次 Commit。")
+                        self.show_info_async("已重命名最近一次 Commit", "这次没有检测到新的改动，已把最近一次提交改名为：\n" + renamed_message)
+                    else:
+                        self.write_log("没有新的改动需要 commit，且当前没有可重命名的历史提交。")
+                        self.run_on_ui_thread(self.tip_var.set, "没有新的改动需要提交。")
+                        self.show_info_async("没有新的改动", "这次没有检测到新的改动，且当前仓库还没有历史提交，所以没有生成 commit。")
                 else:
+                    self.run_on_ui_thread(self.invalidate_commit_list_cache)
                     self.run_on_ui_thread(self.tip_var.set, "手动 Commit 已完成。")
                     self.show_info_async("Commit 已完成", "已成功生成提交：\n" + commit_message)
                 self.request_status_refresh(force=True)
@@ -1885,6 +2202,7 @@ class AutoCommitApp:
             else:
                 branch = "unborn"
                 branch_state = "empty repository"
+        local_branches = self.list_local_branches(repo_path)
 
         status_lines = self.run_git(repo_path, "status", "--porcelain", "--branch").stdout.splitlines()
         changed_paths: list[Path] = []
@@ -1906,12 +2224,14 @@ class AutoCommitApp:
                 changed_paths.append(repo_path / path_text)
 
         history_limit = self.commit_refresh_limit + 1
+        history_args = self.get_commit_scope_log_args(repo_path)
         history_result = self.run_git(
             repo_path,
             "log",
             f"-{history_limit}",
             "--date=format:%Y-%m-%d %H:%M:%S",
             "--pretty=%H|%h|%ad|%s",
+            *history_args,
             check=False,
         )
         history_lines = history_result.stdout.splitlines() if history_result.returncode == 0 else []
@@ -1948,6 +2268,7 @@ class AutoCommitApp:
         return RepoSnapshot(
             branch=branch,
             branch_state=branch_state,
+            local_branches=local_branches,
             ahead=ahead,
             behind=behind,
             dirty=dirty,
@@ -1970,6 +2291,8 @@ class AutoCommitApp:
                 return
 
         self.branch_var.set(f"branch {snapshot.branch}")
+        current_branch = snapshot.branch if snapshot.branch_state == "姝ｅ父鍒嗘敮" else ""
+        self.update_commit_scope_options(current_branch, snapshot.local_branches)
         if snapshot.branch_state == "empty repository":
             self.worktree_var.set("仓库已初始化，但还没有提交")
             self.tip_var.set("这是一个新的 Git 仓库。请先 Commit 一次，再执行 Push。")
@@ -2071,6 +2394,8 @@ class AutoCommitApp:
                 return
 
         self.branch_var.set(f"branch {snapshot.branch}")
+        current_branch = snapshot.branch if snapshot.branch_state == "姝ｅ父鍒嗘敮" else ""
+        self.update_commit_scope_options(current_branch, snapshot.local_branches)
         if snapshot.branch_state == "empty repository":
             self.worktree_var.set("仓库已初始化，但还没有提交")
             self.tip_var.set("这是一个新的 Git 仓库。请先 Commit 一次，再执行 Push。")
@@ -2202,6 +2527,7 @@ class AutoCommitApp:
             f"-{limit}",
             "--date=format:%Y-%m-%d %H:%M:%S",
             "--pretty=%H|%h|%ad|%s",
+            *self.get_commit_scope_log_args(repo_path),
         ).stdout.splitlines()
         commits: list[CommitItem] = []
         for line in history_lines:
@@ -2260,6 +2586,11 @@ class AutoCommitApp:
             tail_start = len(recent_commits) - overlap_count
             return list(recent_commits) + self.displayed_commits[tail_start:]
         return list(recent_commits)
+
+    def invalidate_commit_list_cache(self):
+        self.displayed_commits = []
+        self.last_commit_signature = []
+        self.last_rendered_commit_empty = False
 
     def sync_commit_rows(self, commits: list[CommitItem]):
         self.hide_empty_commit_row()
