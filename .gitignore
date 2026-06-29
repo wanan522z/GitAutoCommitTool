@@ -1,23 +1,38 @@
+# Python cache
 __pycache__/
-*.pyc
-*.pyo
-*.log
-build/
-dist/
-git_auto_commit_gui_config.json
-repo_locks/
-*.lock
+*.py[cod]
+
+# Virtual environments
 .venv/
 venv/
 env/
 .env
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
+
+# Tool runtime files
+*.log
+*.lock
+git_auto_commit_gui_config.json
+repo_locks/
+
+# Build artifacts
+build/
+dist/
+
+# Local test or probe repositories
+tmp_repro_repo/
+tmp_commit_probe/
+tmp_init_probe/
+
+# IDE and OS files
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
-tmp_repro_repo/
-tmp_commit_probe/
-tmp_init_probe/
+
+# Python tooling cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local backup snapshots, not source of truth
+*_before_*.py
